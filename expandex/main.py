@@ -1,10 +1,15 @@
 import re
 import os
+import PIL
 import sys
 import json
+import time
+import imghdr
 import hashlib
 import requests
 import cloudscraper
+import numpy as np
+from antidupe import Antidupe
 from pathlib import Path
 from threading import Thread
 from PIL import Image
@@ -28,6 +33,14 @@ image_extensions = [
     ".svg",
 ]
 
+DEFAULTS = {
+    'ih': 0.1,
+    'ssim': 0.15,
+    'cs': 0.1,
+    'cnn': 0.15,
+    'dedup': 0.1
+}
+
 
 class Locator:
     """
@@ -39,6 +52,9 @@ class Locator:
     context = None
     returns = 0
     depth = 0
+    size = (0, 0)
+    mat = None
+    threads = 0
 
     selectors = {
         'similar_image_button': '[id^="CbirNavigation-"] > nav > div > div > div > div > '
@@ -66,9 +82,61 @@ class Locator:
                        '> a',
     }
 
-    def __init__(self, save_folder: str = '', debug: bool = False):
+    def __init__(self, save_folder: str = '', deduplicate: str = 'cpu', weights: dict = DEFAULTS, debug: bool = False):  # noqa
         self.debug = debug
         self.save_folder = save_folder
+        self.deduplicate = deduplicate
+        if self.deduplicate:
+            self.deduplicator = Antidupe(
+                device=self.deduplicate,
+                limits=weights,
+                debug=self.debug
+            )
+
+    @staticmethod
+    def _autocrop(image: Image.Image) -> Image.Image:
+        """
+        https://stackoverflow.com/questions/14211340/automatically-cropping-an-image-with-python-pil
+        """
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
+
+        image_data = np.asarray(image)
+        image_data_bw = image_data.max(axis=2)
+        non_empty_columns = np.where(image_data_bw.max(axis=0) > 0)[0]
+        non_empty_rows = np.where(image_data_bw.max(axis=1) > 0)[0]
+        cropBox = (min(non_empty_rows), max(non_empty_rows), min(non_empty_columns), max(non_empty_columns))
+
+        image_data_new = image_data[cropBox[0]:cropBox[1] + 1, cropBox[2]:cropBox[3] + 1, :]
+
+        return Image.fromarray(image_data_new)
+
+    def _deduplicate(self, image: np.ndarray) -> bool:
+        """
+        Checks to see if the image is a duplicate of one of the ones in the save folder.
+        """
+        result = False
+        images = os.listdir(self.save_folder)
+        if self.deduplicator.predict([image.copy(), self.mat.copy()]):  # Check original.
+            result = True
+        else:
+            for image_file in images:  # Check downloaded images.
+                if self.term:
+                    break
+                image_file_path = os.path.join(self.save_folder, image_file)
+                if os.path.isdir(image_file_path):
+                    continue
+                if not imghdr.what(image_file_path):
+                    continue
+                try:
+                    im = Image.open(image_file_path)
+                except (IOError, OSError):
+                    continue
+                dupe = self.deduplicator.predict([image.copy(), im])
+                if dupe:
+                    result = True
+                    break
+        return result
 
     def d_print(self, *args, **kwargs):
         """
@@ -99,6 +167,8 @@ class Locator:
         matches = re.findall(r'[^/\\]*\.\w+', url)
         if matches:
             for match in matches:
+                if self.term:
+                    break
                 self.d_print(match)
                 for ext in image_extensions:
                     if match.endswith(ext):
@@ -153,19 +223,43 @@ class Locator:
 
     def get_search_root(self, image_path: Path) -> str:
         """
-        Uploads an image to pasteboard and returns it's url.
+        Uploads an image to pasteboard and returns its URL.
 
         NOTE: Image_path must be a full path to a local image file **not** relative.
         """
         if not image_path.is_file():
             raise FileNotFoundError
+
+        image = Image.open(image_path)
+        self.mat = image
+
+        # Determine image format and set appropriate content type
+        image_format = image.format.lower()
+        if image_format == "jpeg":
+            content_type = "image/jpeg"
+        elif image_format == "png":
+            content_type = "image/png"
+        elif image_format == "gif":
+            content_type = "image/gif"
+        else:
+            raise ValueError("Unsupported image format")
+
+        # Get image size
+        size = image.size
+        channels = 3  # Assuming RGB image
+        if len(image.getbands()) == 4:
+            channels = 4  # Alpha channel present
+
+        # Set self.size variable
+        self.size = (*size, channels)
+
         image_path = image_path.resolve().as_posix()
         if not self.save_folder:
             self.save_folder = f"{image_path}_images"
         os.makedirs(self.save_folder, exist_ok=True)
         file_path = image_path
         search_url = self.search_url
-        files = {'upfile': ('blob', open(file_path, 'rb'), 'image/jpeg')}
+        files = {'upfile': ('blob', open(file_path, 'rb'), content_type)}
         params = {'rpt': 'imageview', 'format': 'json',
                   'request': '{"blocks":[{"block":"b-page_type_search-by-image__link"}]}'}
         response = requests.post(search_url, params=params, files=files)
@@ -228,36 +322,62 @@ class Locator:
         """
         Aptly named.
         """
-        name = self.extract_filename_from_url(image_url)
-        if name is None:
-            filename = 'hidden'
-        else:
-            filename = name
-            if os.path.exists(os.path.join(self.save_folder, filename)):
-                self.d_print(f"Skipping {filename}. File already exists.")
-                self.returns += 1
-                return None
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        response = requests.get(image_url, headers=headers)
-        if response.status_code == 200:
+        self.threads += 1
+        if '127.0.0.1' not in image_url:
+            name = self.extract_filename_from_url(image_url)
             if name is None:
-                image_format = self.get_image_format(response.content)
-                if image_format is None:
-                    self.d_print(f'skipping bad image: {image_url}')
+                filename = 'hidden'
+            else:
+                filename = name
+                if os.path.exists(os.path.join(self.save_folder, filename)):
+                    self.d_print(f"Skipping {filename}. File already exists.")
+                    self.returns += 1
+                    self.threads -= 1
                     return None
-                filename = f"{self.generate_md5(response.content)}.{image_format}"
-                pass
-            with open(os.path.join(self.save_folder, filename), 'wb') as f:
-                f.write(response.content)
-            self.d_print(f"Downloaded {filename}")
-            self.returns += 1
+            headers = {'User-Agent': 'Mozilla/5.0'}
+            response = requests.get(image_url, headers=headers)
+            if response.status_code == 200:
+                if name is None:
+                    image_format = self.get_image_format(response.content)
+                    if image_format is None:
+                        self.d_print(f'skipping bad image: {image_url}')
+                        self.threads -= 1
+                        return None
+                    filename = f"{self.generate_md5(response.content)}.{image_format}"
+                    pass
+                bad = False
+                if self.deduplicate:
+                    try:
+                        image = Image.open(BytesIO(response.content))
+                        image = self._autocrop(image)
+                        image_array = np.array(image)
+                        bad = self._deduplicate(image_array)
+                        if bad:
+                            self.d_print(f'skipping duplicate image: {image_url}')
+                    except PIL.UnidentifiedImageError:
+                        self.d_print(f"Skipping unreadable image: {image_url}")
+                        bad = True
+                if not bad and self.returns < self.depth:
+                    self.returns += 1
+                    with open(os.path.join(self.save_folder, filename), 'wb') as f:
+                        f.write(response.content)
+                    self.d_print(f"Downloaded {filename}")
+                    self.d_print('\nreturns\n', self.returns)
+
+            else:
+                self.d_print(f"Failed to download {image_url}. Status code: {response.status_code}")
         else:
-            self.d_print(f"Failed to download {image_url}. Status code: {response.status_code}")
+            self.d_print(f"skipping localhost redirect: {image_url}")
+        self.threads -= 1
+        return None
 
     def get_similar_images(self, page: any, depth: int = 4) -> list:
         """
         This will locate similar images and return up to the number specified in the `depth` argument.
         """
+        self.returns = 0
+        self.depth = depth
+        self.term = False
         result = list()
         image_links = list()
         button = self.selectors['similar_image_button']
@@ -272,16 +392,23 @@ class Locator:
                     url = f"{self.search_url}{link.replace('/images/search', '')}"
                     image_links.append(url)
         for image_link in image_links:
+            if self.term:
+                break
             self.retries[image_link] = 0
             link = self.get_image_link(page, image_link)
             if link is not None:
                 result.append(link)
                 if self.returns >= depth:
-                    self.returns = 0
+                    self.d_print('successfully located the requested image depth, operation complete')
+                    self.term = True
                     break
-                thread = Thread(target=self.download_image, args=(link, ), daemon=True)
-                thread.start()
-            self.d_print('\nreturns\n', self.returns)
+                while self.threads >= (self.depth - self.returns):
+                    if self.term or self.depth - self.returns == 0:
+                        return result
+                    time.sleep(0.1)
+                if not self.term:
+                    thread = Thread(target=self.download_image, args=(link, ), daemon=True)
+                    thread.start()
         return result
 
     def test_similar_images(self):
