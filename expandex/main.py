@@ -34,11 +34,11 @@ image_extensions = [
 ]
 
 DEFAULTS = {
-    'ih': 0.1,
-    'ssim': 0.15,
-    'cs': 0.1,
-    'cnn': 0.15,
-    'dedup': 0.1
+    'ih': 0.1,  # 8x8x1 Image Hash similarity.
+    'ssim': 0.15,  # Structural similarity index measurement.
+    'cs': 0.1,  # NumPy cosine similarity.
+    'cnn': 0.15,  # EfficientNet feature extraction.
+    'dedup': 0.1  # Mobilenet cosine similarities.
 }
 
 
@@ -145,6 +145,89 @@ class Locator:
         if self.debug:
             print(*args, **kwargs)
 
+    def _set_save_folder(self, location: str) -> None:
+        """
+        Configure our save directory
+        """
+        if not self.save_folder:
+            self.save_folder = f"{location}_images"
+        os.makedirs(self.save_folder, exist_ok=True)
+
+    def _get_image_from_anything(self, image: [Path, np.ndarray, Image.Image, str]) -> Image.Image:
+        """
+        Collect an image from a file, mat, array, or url.
+        """
+        def get_name_from_path(path: Path) -> str:
+            """
+            Collects a filename from a Path object.
+            """
+            name = f"{path.stem}{path.suffix}"
+            return name.lower()
+
+        def is_url_or_filepath(input_string):
+            url_pattern = r'^https?://.+'
+            filepath_pattern = r'^(/|([a-zA-Z]:)?\\).+'
+            if re.match(url_pattern, input_string):
+                return "url"
+            elif re.match(filepath_pattern, input_string):
+                return "file"
+            else:
+                return None
+
+        if isinstance(image, str):  # Path string.
+            op = is_url_or_filepath(image)
+            if op == 'file':
+                image = Path(image)
+
+        if isinstance(image, np.ndarray):  # Numpy array.
+            result = Image.fromarray(image)
+            self._set_save_folder('np_array')
+        elif isinstance(image, Image.Image):  # PIL image.
+            result = image
+            self._set_save_folder('pil_image')
+        elif isinstance(image, Path):  # Pathlib path object.
+            result = image.expanduser().resolve()
+            if not result.is_file():
+                raise FileNotFoundError()
+            self._set_save_folder(get_name_from_path(result))
+            result = Image.open(result.as_posix())
+        elif isinstance(image, str):  # URL string.
+            file_name = self.extract_filename_from_url(image)
+            if not file_name:
+                file_name = 'url'
+            file_name = file_name.lower()
+            self._set_save_folder(file_name)
+            original_setting = bool(self.deduplicate)
+            self.deduplicate, self.returns = False, -1
+            self.download_image(image)
+            self.deduplicate, self.returns = original_setting, 0
+            result = Image.open(f"{self.save_folder}/{file_name}")
+        else:
+            raise TypeError(f'unable to locate image from {type(image)}')
+        return result
+
+    def test_get_anything(self):
+        """
+        Just a quick test of the method above.
+        """
+        mat = Image.open('bug.jpg')
+        images = [
+            'https://upload.wikimedia.org/wikipedia/commons/d/d5/Bug.jpg',
+            'bug.jpg',
+            Path('bug.jpg'),
+            mat,
+            np.array(mat)
+        ]
+        for idx, image in enumerate(images):
+            print(idx, self.save_folder)
+            result = self._get_image_from_anything(image)
+            print(type(result))
+            self.save_folder = ''
+        self.save_folder = './test_images'
+        for idx, image in enumerate(images):
+            result = self._get_image_from_anything(image)
+            print(idx, type(result), self.save_folder)
+
     @staticmethod
     def generate_md5(content):
         md5 = hashlib.md5()
@@ -160,7 +243,7 @@ class Locator:
             self.d_print("Error:", e)
             return None
 
-    def extract_filename_from_url(self, url: str):
+    def extract_filename_from_url(self, url: str) -> [str, None]:
         """
         Extract file names from URLs
         """
@@ -172,7 +255,7 @@ class Locator:
                 self.d_print(match)
                 for ext in image_extensions:
                     if match.endswith(ext):
-                        return match
+                        return match.lower()
         else:
             return None
 
@@ -221,58 +304,31 @@ class Locator:
             scraper.close()
         return result
 
-    def get_search_root(self, image_path: Path) -> str:
+    def get_search_root(self, image: Image.Image) -> str:
         """
         Uploads an image to pasteboard and returns its URL.
 
         NOTE: Image_path must be a full path to a local image file **not** relative.
         """
-        if not image_path.is_file():
-            raise FileNotFoundError
-
-        image = Image.open(image_path)
         self.mat = image
-
-        # Determine image format and set appropriate content type
-        image_format = image.format.lower()
-        if image_format == "jpeg":
-            content_type = "image/jpeg"
-        elif image_format == "png":
-            content_type = "image/png"
-        elif image_format == "gif":
-            content_type = "image/gif"
-        else:
-            raise ValueError("Unsupported image format")
-
-        # Get image size
-        size = image.size
-        channels = 3  # Assuming RGB image
-        if len(image.getbands()) == 4:
-            channels = 4  # Alpha channel present
-
-        # Set self.size variable
-        self.size = (*size, channels)
-
-        image_path = image_path.resolve().as_posix()
-        if not self.save_folder:
-            self.save_folder = f"{image_path}_images"
-        os.makedirs(self.save_folder, exist_ok=True)
-        file_path = image_path
-        search_url = self.search_url
-        files = {'upfile': ('blob', open(file_path, 'rb'), content_type)}
+        content_type = 'image/jpeg'
+        image_bytes = BytesIO()
+        image.save(image_bytes, format='JPEG')
+        image_bytes.seek(0)
+        files = {'upfile': ('blob', image_bytes, content_type)}
         params = {'rpt': 'imageview', 'format': 'json',
                   'request': '{"blocks":[{"block":"b-page_type_search-by-image__link"}]}'}
-        response = requests.post(search_url, params=params, files=files)
+        response = requests.post(self.search_url, params=params, files=files)
         query_string = json.loads(response.content)['blocks'][0]['params']['url']
-        img_search_url = search_url + '?' + query_string
+        img_search_url = self.search_url + '?' + query_string
         return img_search_url
 
     def test_upload_image(self) -> str:
         """
         Simple test of the logic above.
         """
-        image_path = test_image
-        img_search_url = self.get_search_root(image_path)
+        image = self._get_image_from_anything(test_image)
+        img_search_url = self.get_search_root(image)
         self.d_print(img_search_url)
         return img_search_url
 
@@ -425,3 +481,27 @@ class Locator:
             **kwargs
         )
         return result
+
+    def scout(self, image: [Path, np.ndarray, Image.Image], depth: int = 10):
+        """
+        Send a path, or image mat and discover similar images.
+
+        Gather to the number of images specified in the depth argument.
+        """
+        kwargs = {
+            'depth': depth
+        }
+        image = self._get_image_from_anything(image)
+        search_url = self.get_search_root(image)
+        result = self.init_web(
+            destination_url=search_url,
+            callback=self.get_similar_images,
+            **kwargs
+        )
+        return result
+
+    def test_scout(self):
+        """
+        Tests the method above.
+        """
+        self.scout(test_image)
