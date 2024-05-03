@@ -3,7 +3,7 @@
 
 # Expandex
 
-Expandex is a Python library designed to find images similar to a given source image. It utilizes online image searches, feature extraction, and image deduplication to retrieve images that closely resemble the input image.
+Expandex is a Python library designed to find images similar to a given source image. It utilizes online image searches, feature extraction, and image deduplication to retrieve unique and usable images.
 
 ## Installation
 
